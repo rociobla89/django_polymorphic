@@ -18,7 +18,7 @@ from django.utils.encoding import force_text
 from django.utils.http import urlencode
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
-
+from polymorphic.templatetags.polymorphic_admin_urls import add_preserved_filters as child_add_preserved_filters
 
 try:
     # Django 1.6 implements this
@@ -414,6 +414,18 @@ class PolymorphicParentModelAdmin(admin.ModelAdmin):
         ]
 
 
+IS_POPUP_VAR = '_popup'
+TO_FIELD_VAR = '_to_field'
+
+def get_content_type_for_model(obj):
+    # Since this module gets imported in the application's root package,
+    # it cannot import models from other applications at the module level.
+    from django.contrib.contenttypes.models import ContentType
+    return ContentType.objects.get_for_model(obj, for_concrete_model=False)
+
+from django.template.response import SimpleTemplateResponse, TemplateResponse
+from django.contrib import messages
+from django.core.urlresolvers import reverse
 
 class PolymorphicChildModelAdmin(admin.ModelAdmin):
     """
@@ -491,11 +503,11 @@ class PolymorphicChildModelAdmin(admin.ModelAdmin):
         ]
 
 
-    def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
-        context.update({
-            'base_opts': self.base_model._meta,
-        })
-        return super(PolymorphicChildModelAdmin, self).render_change_form(request, context, add=add, change=change, form_url=form_url, obj=obj)
+#     def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
+#         context.update({
+#             'base_opts': self.base_model._meta,
+#         })
+#         return super(PolymorphicChildModelAdmin, self).render_change_form(request, context, add=add, change=change, form_url=form_url, obj=obj)
 
 
     def delete_view(self, request, object_id, context=None):
@@ -504,6 +516,210 @@ class PolymorphicChildModelAdmin(admin.ModelAdmin):
         }
         return super(PolymorphicChildModelAdmin, self).delete_view(request, object_id, extra_context)
 
+    
+    #BITE2
+    def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
+        opts = self.model._meta
+        app_label = opts.app_label
+        preserved_filters = self.get_preserved_filters(request)
+        form_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, form_url)
+        view_on_site_url = self.get_view_on_site_url(obj)
+        context.update({
+            'add': add,
+            'change': change,
+            'has_add_permission': self.has_add_permission(request),
+            'has_change_permission': self.has_change_permission(request, obj),
+            'has_delete_permission': self.has_delete_permission(request, obj),
+            'has_file_field': True,  # FIXME - this should check if form or formsets have a FileField,
+            'has_absolute_url': view_on_site_url is not None,
+            'absolute_url': view_on_site_url,
+            'form_url': form_url,
+            'opts': opts,
+            'content_type_id': get_content_type_for_model(self.model).pk,
+            'save_as': self.save_as,
+            'save_on_top': self.save_on_top,
+            'to_field_var': TO_FIELD_VAR,
+            'is_popup_var': IS_POPUP_VAR,
+            'app_label': app_label,
+            'base_opts': self.base_model._meta, #agregado de la nueva version
+        })
+        if add and self.add_form_template is not None:
+            form_template = self.add_form_template
+        else:
+            form_template = self.change_form_template
+
+        return TemplateResponse(request, form_template or [
+            "admin/%s/%s/change_form.html" % (app_label, opts.model_name),
+            "admin/%s/change_form.html" % app_label,
+            "admin/change_form.html"
+        ], context, current_app=self.admin_site.name)
+
+    def response_add(self, request, obj, post_url_continue=None):
+        """
+        Determines the HttpResponse for the add_view stage.
+        """
+        opts = obj._meta
+        pk_value = obj._get_pk_val()
+        preserved_filters = self.get_preserved_filters(request)
+        msg_dict = {'name': force_text(opts.verbose_name), 'obj': force_text(obj)}
+        # Here, we distinguish between different save types by checking for
+        # the presence of keys in request.POST.
+
+        if IS_POPUP_VAR in request.POST:
+            to_field = request.POST.get(TO_FIELD_VAR)
+            if to_field:
+                attr = str(to_field)
+            else:
+                attr = obj._meta.pk.attname
+            value = obj.serializable_value(attr)
+            return SimpleTemplateResponse('admin/popup_response.html', {
+                'pk_value': escape(pk_value),  # for possible backwards-compatibility
+                'value': escape(value),
+                'obj': escapejs(obj)
+            })
+
+        elif "_continue" in request.POST:
+            msg = _('The %(name)s "%(obj)s" was added successfully. You may edit it again below.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            if post_url_continue is None:
+                post_url_continue = reverse('admin:%s_%s_change' %
+                                            (opts.app_label, opts.model_name),
+                                            args=(quote(pk_value),),
+                                            current_app=self.admin_site.name)
+            post_url_continue = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, post_url_continue)
+            return HttpResponseRedirect(post_url_continue)
+
+        elif "_addanother" in request.POST:
+            msg = _('The %(name)s "%(obj)s" was added successfully. You may add another %(name)s below.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            redirect_url = request.path
+            redirect_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, redirect_url)
+            return HttpResponseRedirect(redirect_url)
+
+        else:
+            msg = _('The %(name)s "%(obj)s" was added successfully.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            return self.response_post_save_add(request, obj)
+
+    def response_change(self, request, obj):
+        """
+        Determines the HttpResponse for the change_view stage.
+        """
+
+        opts = self.model._meta
+        pk_value = obj._get_pk_val()
+        preserved_filters = self.get_preserved_filters(request)
+
+        msg_dict = {'name': force_text(opts.verbose_name), 'obj': force_text(obj)}
+        if "_continue" in request.POST:
+            msg = _('The %(name)s "%(obj)s" was changed successfully. You may edit it again below.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            redirect_url = request.path
+            redirect_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, redirect_url)
+            return HttpResponseRedirect(redirect_url)
+
+        elif "_saveasnew" in request.POST:
+            msg = _('The %(name)s "%(obj)s" was added successfully. You may edit it again below.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            redirect_url = reverse('admin:%s_%s_change' %
+                                   (opts.app_label, opts.model_name),
+                                   args=(pk_value,),
+                                   current_app=self.admin_site.name)
+            redirect_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, redirect_url)
+            return HttpResponseRedirect(redirect_url)
+
+        elif "_addanother" in request.POST:
+            msg = _('The %(name)s "%(obj)s" was changed successfully. You may add another %(name)s below.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            redirect_url = reverse('admin:%s_%s_add' %
+                                   (opts.app_label, opts.model_name),
+                                   current_app=self.admin_site.name)
+            redirect_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, redirect_url)
+            return HttpResponseRedirect(redirect_url)
+
+        else:
+            msg = _('The %(name)s "%(obj)s" was changed successfully.') % msg_dict
+            self.message_user(request, msg, messages.SUCCESS)
+            return self.response_post_save_change(request, obj)
+
+    def response_post_save_add(self, request, obj):
+        """
+        Figure out where to redirect after the 'Save' button has been pressed
+        when adding a new object.
+        """
+        opts = self.model._meta
+        if self.has_change_permission(request, None):
+            post_url = reverse('admin:%s_%s_changelist' %
+                               (opts.app_label, opts.model_name),
+                               current_app=self.admin_site.name)
+            preserved_filters = self.get_preserved_filters(request)
+            post_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, post_url)
+        else:
+            post_url = reverse('admin:index',
+                               current_app=self.admin_site.name)
+        return HttpResponseRedirect(post_url)
+
+    def response_post_save_change(self, request, obj):
+        """
+        Figure out where to redirect after the 'Save' button has been pressed
+        when editing an existing object.
+        """
+        opts = self.model._meta
+
+        if self.has_change_permission(request, None):
+            post_url = reverse('admin:%s_%s_changelist' %
+                               (opts.app_label, opts.model_name),
+                               current_app=self.admin_site.name)
+            preserved_filters = self.get_preserved_filters(request)
+            post_url = child_add_preserved_filters({'preserved_filters': preserved_filters, 'opts': opts}, post_url)
+        else:
+            post_url = reverse('admin:index',
+                               current_app=self.admin_site.name)
+        return HttpResponseRedirect(post_url)
+    
+    def response_delete(self, request, obj_display):
+        """
+        Determines the HttpResponse for the delete_view stage.
+        """
+
+        opts = self.model._meta
+
+        self.message_user(request,
+            _('The %(name)s "%(obj)s" was deleted successfully.') % {
+                'name': force_text(opts.verbose_name),
+                'obj': force_text(obj_display)
+            }, messages.SUCCESS)
+
+        if self.has_change_permission(request, None):
+            post_url = reverse('admin:%s_%s_changelist' %
+                               (opts.app_label, opts.model_name),
+                               current_app=self.admin_site.name)
+            preserved_filters = self.get_preserved_filters(request)
+            post_url = child_add_preserved_filters(
+                {'preserved_filters': preserved_filters, 'opts': opts}, post_url
+            )
+        else:
+            post_url = reverse('admin:index',
+                               current_app=self.admin_site.name)
+        return HttpResponseRedirect(post_url)
+    
+    def get_preserved_filters(self, request):
+        """
+        Returns the preserved filters querystring.
+        """
+        match = request.resolver_match
+        if self.preserve_filters and match:
+            opts = self.model
+            current_url = '%s:%s' % (match.app_name, match.url_name)
+            changelist_url = 'admin:%s_%s_changelist' % (opts._meta.app_label, opts.__base__._meta.model_name)
+            if current_url == changelist_url:
+                preserved_filters = request.GET.urlencode()
+            else:
+                preserved_filters = request.GET.get('_changelist_filters')
+
+            if preserved_filters:
+                return urlencode({'_changelist_filters': preserved_filters})
+        return ''
 
     # ---- Extra: improving the form/fieldset default display ----
 
